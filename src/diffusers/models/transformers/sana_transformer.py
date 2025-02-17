@@ -143,6 +143,9 @@ class SanaTransformerBlock(nn.Module):
                 out_bias=attention_out_bias,
                 processor=AttnProcessor2_0(),
             )
+        else:
+            self.norm2 = None
+            self.attn2 = None
 
         # 3. Feed-forward
         self.ff = GLUMBConv(dim, dim, mlp_ratio, norm_type=None, residual_connection=False)
@@ -183,11 +186,14 @@ class SanaTransformerBlock(nn.Module):
             )
             hidden_states = attn_output + hidden_states
 
-        # 4. Feed-forward
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
-
+            norm_hidden_states = self.norm2(hidden_states)
+            
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        else:
+            norm_hidden_states = hidden_states
         norm_hidden_states = norm_hidden_states.unflatten(1, (height, width)).permute(0, 3, 1, 2)
+
+        # 4. Feed-forward
         ff_output = self.ff(norm_hidden_states)
         ff_output = ff_output.flatten(2, 3).permute(0, 2, 1)
         hidden_states = hidden_states + gate_mlp * ff_output
@@ -249,7 +255,7 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         num_cross_attention_heads: Optional[int] = 20,
         cross_attention_head_dim: Optional[int] = 112,
         cross_attention_dim: Optional[int] = 2240,
-        caption_channels: int = 2304,
+        caption_channels: Optional[int] = 2304,
         mlp_ratio: float = 2.5,
         dropout: float = 0.0,
         attention_bias: bool = False,
@@ -278,8 +284,12 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # 2. Additional condition embeddings
         self.time_embed = AdaLayerNormSingle(inner_dim)
 
-        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
-        self.caption_norm = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
+        if caption_channels is not None:
+            self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
+            self.caption_norm = RMSNorm(inner_dim, eps=1e-5, elementwise_affine=True)
+        else:
+            self.caption_projection = None
+            self.caption_norm = None
 
         # 3. Transformer blocks
         self.transformer_blocks = nn.ModuleList(
@@ -371,8 +381,8 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
@@ -427,10 +437,11 @@ class SanaTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             timestep, batch_size=batch_size, hidden_dtype=hidden_states.dtype
         )
 
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+        if self.caption_projection is not None:
+            encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+            encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
 
-        encoder_hidden_states = self.caption_norm(encoder_hidden_states)
+            encoder_hidden_states = self.caption_norm(encoder_hidden_states)
 
         # 2. Transformer blocks
         if torch.is_grad_enabled() and self.gradient_checkpointing:
